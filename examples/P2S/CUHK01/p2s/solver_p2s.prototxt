@@ -1,0 +1,16 @@
+net: "examples/CUHK01/p2s/train_val_p2s.prototxt"
+test_iter: 50
+test_interval: 100
+base_lr: 0.01
+lr_policy: "multistep"
+gamma: 0.1
+stepvalue: 10000
+stepvalue: 20000
+stepvalue: 30000
+display: 100
+max_iter: 40000
+momentum: 0.9
+weight_decay: 0.0001
+snapshot: 2000
+snapshot_prefix: "examples/CUHK01/caffemodel/margin1=0.1_margin2=0.5_margin3=1.2_weight=0.15/CUHK01_p2s"
+solver_mode: GPU

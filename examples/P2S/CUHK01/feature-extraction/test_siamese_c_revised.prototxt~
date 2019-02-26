@@ -1,0 +1,181 @@
+name: "personReIDSiamese"
+
+layer {
+  name: "personA"
+  type: "ImageData"
+  top: "personA"
+  top: "labelA"
+  image_data_param {
+    #source: "examples/VIPeR/data/testProb.txt"
+    source: "examples/VIPeR/data/testGallary.txt"
+    batch_size: 128
+  }
+  transform_param {
+     mirror: true
+     crop_size_h: 230
+     crop_size_w: 80
+     mean_file: "examples/VIPeR/data/mean_val.binaryproto"
+  }
+  include: { phase: TEST }
+}
+
+layer {
+  name: "convA1"
+  type: "Convolution"
+  bottom: "personA"
+  top: "convA1"
+  param {
+    name: "conv1_w"
+    lr_mult: 1
+    decay_mult: 1
+  }
+  param {
+    name: "conv1_b"
+    lr_mult: 2
+    decay_mult: 0
+  }
+  convolution_param {
+    num_output: 64
+    kernel_size: 7
+    stride: 3
+    weight_filler {
+      type: "gaussian"
+      std: 0.01
+    }
+    bias_filler {
+      type: "constant"
+      value: 0
+    }
+  }
+}
+
+layer {
+  name: "reluA1"
+  type: "ReLU"
+  bottom: "convA1"
+  top: "convA1"
+}
+
+layer {
+  name: "poolA1"
+  type: "Pooling"
+  bottom: "convA1"
+  top: "poolA1"
+  pooling_param {
+    pool: MAX
+    kernel_size: 3
+    stride: 3
+  }
+}
+
+layer {
+  name: "convA2"
+  type: "Convolution"
+  bottom: "poolA1"
+  top: "convA2"
+  param {
+    name: "conv2_w"
+    lr_mult: 1
+    decay_mult: 1
+  }
+  param {
+    name: "conv2_b"
+    lr_mult: 2
+    decay_mult: 0
+  }
+  convolution_param {
+    num_output: 32
+    kernel_size: 5
+    stride: 1
+    weight_filler {
+      type: "gaussian"
+      std: 0.01
+    }
+    bias_filler {
+      type: "constant"
+      value: 0
+    }
+  }
+}
+
+layer {
+  name: "reluA2"
+  type: "ReLU"
+  bottom: "convA2"
+  top: "convA2"
+}
+
+layer {
+  name: "poolA2"
+  type: "Pooling"
+  bottom: "convA2"
+  top: "poolA2"
+  pooling_param {
+    pool: MAX
+    kernel_size: 3
+    stride: 3
+  }
+}
+
+layer {
+  name: "fc_7_siameseA"
+  type: "InnerProduct"
+  bottom: "poolA2"
+  top: "fc_7_siameseA"
+  param {
+    name: "fc_7_siameseA_w"
+    lr_mult: 1
+    decay_mult: 1
+  }
+  param {
+    name: "fc_7_siameseA_b"
+    lr_mult: 2
+    decay_mult: 0
+  }
+  inner_product_param {
+    num_output: 400
+    weight_filler {
+      type: "gaussian"
+      std: 0.005
+    }
+    bias_filler {
+      type: "constant"
+      value: 0
+    }
+  }
+}
+
+#layer {
+#  name: "ReLUA3"
+#  type: "ReLU"
+#  bottom: "fc_7_siameseA"
+#  top: "fc_7_siameseA"
+#}
+
+layer {
+  name: "fc_8_siameseA"
+  type: "InnerProduct"
+  bottom: "fc_7_siameseA"
+  top: "fc_8_siameseA"
+  param {
+    name: "fc_8_siameseA_w"
+    lr_mult: 0.01
+    decay_mult: 100
+  }
+  param {
+    name: "fc_8_siameseA_b"
+    lr_mult: 0
+    decay_mult: 0
+  }
+  inner_product_param {
+    num_output: 400
+    weight_filler {
+      type: "gaussian"
+      std: 0.005
+    }
+    bias_filler {
+      type: "constant"
+      value: 0
+    }
+  }
+}

@@ -1,0 +1,62 @@
+#include <vector>
+
+#include "caffe/layer.hpp"
+#include "caffe/util/math_functions.hpp"
+#include "caffe/vision_layers.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void LRNLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  
+}
+
+template <typename Dtype>
+void LRNLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  
+}
+
+template <typename Dtype>
+void LRNLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  
+}
+
+
+template <typename Dtype>
+void LRNLayer<Dtype>::WithinChannelForward(
+    const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  split_layer_->Forward(bottom, split_top_vec_);
+  square_layer_->Forward(square_bottom_vec_, square_top_vec_);
+  pool_layer_->Forward(square_top_vec_, pool_top_vec_);
+  power_layer_->Forward(pool_top_vec_, power_top_vec_);
+  product_layer_->Forward(product_bottom_vec_, top);
+}
+
+template <typename Dtype>
+void LRNLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
+  switch (this->layer_param_.lrn_param().norm_region()) {
+  case LRNParameter_NormRegion_ACROSS_CHANNELS:
+    CrossChannelBackward_cpu(top, propagate_down, bottom);
+    break;
+  case LRNParameter_NormRegion_WITHIN_CHANNEL:
+    WithinChannelBackward(top, propagate_down, bottom);
+    break;
+  default:
+    LOG(FATAL) << "Unknown normalization region.";
+  }
+}
+
+
+
+#ifdef CPU_ONLY
+STUB_GPU(L2NormLayer);
+#endif
+
+INSTANTIATE_CLASS(L2NormLayer);
+REGISTER_LAYER_CLASS(L2Norm);
+
+}  // namespace caffe

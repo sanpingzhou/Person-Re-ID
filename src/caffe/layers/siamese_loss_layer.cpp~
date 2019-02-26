@@ -1,0 +1,320 @@
+#include <algorithm>
+#include <vector>
+
+#include "caffe/layer.hpp"
+#include "caffe/loss_layers.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void SiameseLossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  CHECK_EQ(bottom[0]->num(), bottom[1]->num());
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  CHECK_EQ(bottom[1]->channels(), 1);
+  CHECK_EQ(bottom[1]->height(), 1);
+  CHECK_EQ(bottom[1]->width(), 1);
+
+  int numberp = this->layer_param_.siamese_loss_param().numberp();
+  int hardp = this->layer_param_.siamese_loss_param().hardp();
+  int hardn = this->layer_param_.siamese_loss_param().hardn();
+  int num = bottom[0]->num();
+  int numSort = num / (1 + numberp);                                              // different IDs in a batch
+  int numTrain = numSort * (hardp + hardn);                                       // number of training pairs
+  int numInput = numSort * (num - numSort);                                       // number of inputting pairs
+  feature_train_a_.Reshape(numTrain, bottom[0]->channels(), 1, 1);
+  label_train_a_.Reshape(numTrain, 1, 1, 1);
+  index_train_a_.Reshape(numTrain, 1, 1, 1);
+  feature_train_b_.Reshape(numTrain, bottom[0]->channels(), 1, 1);
+  label_train_b_.Reshape(numTrain, 1, 1, 1);
+  index_train_b_.Reshape(numTrain, 1, 1, 1);
+
+  // cached for feature, index and label for inputting pairs
+  feature_input_a_.Reshape(numInput, bottom[0]->channels(), 1, 1);
+  label_input_a_.Reshape(numInput, 1, 1, 1);
+  index_input_a_.Reshape(numInput, 1, 1, 1);
+  feature_input_b_.Reshape(numInput, bottom[0]->channels(), 1, 1);
+  label_input_b_.Reshape(numInput, 1, 1, 1);
+  index_input_b_.Reshape(numInput, 1, 1, 1);
+
+  // cached for feature, index and label for inputting images
+  feature_a_.Reshape(numSort, bottom[0]->channels(), 1, 1);
+  label_a_.Reshape(numSort, 1, 1, 1);
+  index_a_.Reshape(numSort, 1, 1, 1);
+  feature_b_.Reshape(num - numSort, bottom[0]->channels(), 1, 1);
+  label_b_.Reshape(num - numSort, 1, 1, 1);
+  index_b_.Reshape(num - numSort, 1, 1, 1);
+
+  // cached for feature, index and label for training pairs
+  diff_train_ab_.Reshape(numTrain, bottom[0]->channels(), 1, 1);
+  diff_input_ab_.Reshape(numInput, bottom[0]->channels(), 1, 1);
+  dist_sq_train_ab_.Reshape(numTrain, 1, 1, 1);
+  dist_sq_input_ab_.Reshape(numInput, 1, 1, 1);
+}
+
+template <typename Dtype>
+void SiameseContrastiveLossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+ Dtype margin1 = this->layer_param_.siamese_contrastive_loss_param().margin1();
+ Dtype margin2 = this->layer_param_.siamese_contrastive_loss_param().margin2();
+ int numberp = this->layer_param_.siamese_contrastive_loss_param().numberp();
+ int hardp = this->layer_param_.siamese_contrastive_loss_param().hardp();
+ int hardn = this->layer_param_.siamese_contrastive_loss_param().hardn();
+ int num = bottom[0]->num();
+ int numSort = num / (1 + numberp);
+ int numTrain = numSort * (hardp + hardn);
+ int numInput = numSort * (num - numSort);
+ int channels = bottom[0]->channels();
+
+ // copy the feature representation, label and index into the memory
+ int indexQuery = 0;
+ int indexCandidate = 0;
+ for (int i = 0; i < num; ++i) {
+    if (i % (numberp + 1) == 0 ) {
+      caffe_copy(channels,
+                 bottom[0]->cpu_data() + (i * channels),
+                 feature_a_.mutable_cpu_data() + (indexQuery * channels));
+      label_a_.mutable_cpu_data()[indexQuery] = bottom[1]->cpu_data()[i];
+      index_a_.mutable_cpu_data()[indexQuery] = i;
+      indexQuery = indexQuery + 1;
+    } 
+    else {
+      caffe_copy(channels,
+                 bottom[0]->cpu_data() + (i * channels),
+                 feature_b_.mutable_cpu_data() + (indexCandidate * channels));
+      label_b_.mutable_cpu_data()[indexCandidate] = bottom[1]->cpu_data()[i];
+      index_b_.mutable_cpu_data()[indexCandidate] = i;
+      indexCandidate = indexCandidate + 1;
+    }    
+ }
+ 
+ // copy the feature representation, label and index to generate inputting pairs
+ int indexInput = 0;
+ for (int i = 0; i < numSort; ++i) {
+    for (int j = 0; j < num - numSort; ++j) {
+      caffe_copy(channels,
+                 feature_a_.cpu_data() + (i * channels),
+                 feature_input_a_.mutable_cpu_data() + (indexInput * channels));
+      label_input_a_.mutable_cpu_data()[indexInput] = label_a_.cpu_data()[i];
+      index_input_a_.mutable_cpu_data()[indexInput] = index_a_.cpu_data()[i];
+      caffe_copy(channels,
+                 feature_b_.cpu_data() + (j * channels),
+                 feature_input_b_.mutable_cpu_data() + (indexInput * channels));
+      label_input_b_.mutable_cpu_data()[indexInput] = label_b_.cpu_data()[j];
+      index_input_b_.mutable_cpu_data()[indexInput] = index_b_.cpu_data()[j];
+      indexInput = indexInput + 1;     
+    }
+ }
+
+ // computting the distace of inputting pairs
+ caffe_sub(
+      numInput * channels,
+      feature_input_a_.cpu_data(),            // input query features
+      feature_input_b_.cpu_data(),            // input candidate featurs
+      diff_input_ab_.mutable_cpu_data());
+
+ for (int i = 0; i < numInput; ++i) {
+   dist_sq_input_ab_.mutable_cpu_data()[i] = caffe_cpu_dot (channels,
+      diff_input_ab_.cpu_data() + (i * channels), diff_input_ab_.cpu_data() + (i * channels));  
+ }
+
+ Dtype tempDiff[channels];
+ Dtype tempDist;
+ int tempIndex;
+ int tempLabel;
+ // ranking in the local part to choose hardp and hardn
+ for (int i = 0; i < numSort; ++i) { // rank from small to large
+    for (int j = 0; j < num - numSort; ++j) {
+      for (int k = 0; k < num - numSort; ++k) {
+        if (dist_sq_input_ab_.cpu_data()[i * (num - numSort) + j] < dist_sq_input_ab_.cpu_data()[i * (num - numSort) + k]) {
+          caffe_copy(channels, diff_input_ab_.cpu_data() + ((i * (num - numSort) + k) * channels), tempDiff);
+          caffe_copy(channels, 
+                     diff_input_ab_.cpu_data() + ((i * (num - numSort) + j) * channels),
+                     diff_input_ab_.mutable_cpu_data() + ((i * (num - numSort) + k) * channels));
+          caffe_copy(channels, tempDiff, diff_input_ab_.mutable_cpu_data() + ((i * (num - numSort) + j) * channels));
+         
+          caffe_copy(channels, feature_input_a_.cpu_data() + ((i * (num - numSort) + k) * channels), tempDiff);
+          caffe_copy(channels, 
+                     feature_input_a_.cpu_data() + ((i * (num - numSort) + j) * channels),
+                     feature_input_a_.mutable_cpu_data() + ((i * (num - numSort) + k) * channels));
+          caffe_copy(channels, tempDiff, feature_input_a_.mutable_cpu_data() + ((i * (num - numSort) + j) * channels));
+
+          caffe_copy(channels, feature_input_b_.cpu_data() + ((i * (num - numSort) + k) * channels), tempDiff);
+          caffe_copy(channels, 
+                     feature_input_b_.cpu_data() + ((i * (num - numSort) + j) * channels),
+                     feature_input_b_.mutable_cpu_data() + ((i * (num - numSort) + k) * channels));
+          caffe_copy(channels, tempDiff, feature_input_b_.mutable_cpu_data() + ((i * (num - numSort) + j) * channels));
+          
+          tempDist = dist_sq_input_ab_.cpu_data()[i * (num - numSort) + k];
+          dist_sq_input_ab_.mutable_cpu_data()[i * (num - numSort) + k] = dist_sq_input_ab_.cpu_data()[i * (num - numSort) + j];
+          dist_sq_input_ab_.mutable_cpu_data()[i * (num - numSort) + j] = tempDist;
+
+          tempLabel = label_input_a_.cpu_data()[i * (num - numSort) + k];
+          label_input_a_.mutable_cpu_data()[i * (num - numSort) + k] = label_input_a_.cpu_data()[i * (num - numSort) + j];
+          label_input_a_.mutable_cpu_data()[i * (num - numSort) + j] = tempLabel;
+
+          tempLabel = label_input_b_.cpu_data()[i * (num - numSort) + k];
+          label_input_b_.mutable_cpu_data()[i * (num - numSort) + k] = label_input_b_.cpu_data()[i * (num - numSort) + j];
+          label_input_b_.mutable_cpu_data()[i * (num - numSort) + j] = tempLabel;
+
+          tempIndex = index_input_a_.cpu_data()[i * (num - numSort) + k];
+          index_input_a_.mutable_cpu_data()[i * (num - numSort) + k] = index_input_a_.cpu_data()[i * (num - numSort) + j];
+          index_input_a_.mutable_cpu_data()[i * (num - numSort) + j] = tempIndex;
+
+          tempIndex = index_input_b_.cpu_data()[i * (num - numSort) + k];
+          index_input_b_.mutable_cpu_data()[i * (num - numSort) + k] = index_input_b_.cpu_data()[i * (num - numSort) + j];
+          index_input_b_.mutable_cpu_data()[i * (num - numSort) + j] = tempIndex;         
+        }
+      }
+    }
+ }
+ 
+ // choose handp and hardn to generate training pairs
+ for (int i = 0; i < numSort; ++i) {
+   int countHardp = 0;
+   int countHardn = 0;
+   for (int j = 0; j < num - numSort; ++j) {
+      // search for hardp
+      int positiveID = label_input_a_.cpu_data()[i * (num - numSort) + j];
+      int candidateID = label_input_b_.cpu_data()[i * (num - numSort) + j];
+      if (positiveID == candidateID) {
+         caffe_copy(channels, 
+                     diff_input_ab_.cpu_data() + ((i * (num - numSort) + j) * channels),
+                     diff_train_ab_.mutable_cpu_data() + ((i * (hardp + hardn) + countHardp) * channels));
+         caffe_copy(channels, 
+                     feature_input_a_.cpu_data() + ((i * (num - numSort) + j) * channels),
+                     feature_train_a_.mutable_cpu_data() + ((i * (hardp + hardn) + countHardp) * channels));
+         caffe_copy(channels, 
+                     feature_input_b_.cpu_data() + ((i * (num - numSort) + j) * channels),
+                     feature_train_b_.mutable_cpu_data() + ((i * (hardp + hardn) + countHardp) * channels));
+         dist_sq_train_ab_.mutable_cpu_data()[i * (hardp + hardn) + countHardp] = dist_sq_input_ab_.cpu_data()[i * (num - numSort) + j];
+         label_train_a_.mutable_cpu_data()[i * (hardp + hardn) + countHardp] = positiveID;
+         label_train_b_.mutable_cpu_data()[i * (hardp + hardn) + countHardp] = candidateID;
+         index_train_a_.mutable_cpu_data()[i * (hardp + hardn) + countHardp] = index_input_a_.cpu_data()[i * (num - numSort) + j];
+         index_train_b_.mutable_cpu_data()[i * (hardp + hardn) + countHardp] = index_input_b_.cpu_data()[i * (num - numSort) + j];
+         countHardp = countHardp + 1;
+         if (countHardp == hardp) {
+           break;
+         }    
+      }    
+   }
+  // for (int k = num - numSort - 1; k >= 0; --k) {
+   for (int k = 0; k <= num - numSort; ++k) {
+      int negativeID = label_input_a_.cpu_data()[i * (num - numSort) + k];
+      int candidateID = label_input_b_.cpu_data()[i * (num - numSort) + k];
+      if (negativeID != candidateID) {
+        caffe_copy(channels,
+                    diff_input_ab_.cpu_data() + ((i * (num - numSort) + k) * channels),
+                    diff_train_ab_.mutable_cpu_data() + ((i * (hardp + hardn) + hardp + countHardn) * channels));
+        caffe_copy(channels,
+                    feature_input_a_.cpu_data() + ((i * (num - numSort) + k) * channels),
+                    feature_train_a_.mutable_cpu_data() + ((i * (hardp + hardn) + hardp + countHardn) * channels));
+        caffe_copy(channels,
+                    feature_input_b_.cpu_data() + ((i * (num - numSort) + k) * channels),
+                    feature_train_b_.mutable_cpu_data() + ((i * (hardp + hardn) + hardp + countHardn) * channels));
+        dist_sq_train_ab_.mutable_cpu_data()[i * (hardp + hardn) + hardp + countHardn] = dist_sq_input_ab_.cpu_data()[i * (num - numSort) + k];
+        label_train_a_.mutable_cpu_data()[i * (hardp + hardn) + hardp + countHardn] = negativeID;
+        label_train_b_.mutable_cpu_data()[i * (hardp + hardn) + hardp + countHardn] = candidateID;
+        index_train_a_.mutable_cpu_data()[i * (hardp + hardn) + hardp + countHardn] = index_input_a_.cpu_data()[i * (num - numSort) + k];
+        index_train_b_.mutable_cpu_data()[i * (hardp + hardn) + hardp + countHardn] = index_input_b_.cpu_data()[i * (num - numSort) + k];
+        countHardn = countHardn + 1;
+        if (countHardn == hardn) {
+          break;
+        }
+        
+      }     
+   }  
+ }
+ 
+ // compute loss for forward-propagation and prepare for back-propagation
+ Dtype loss(0.0);
+ for (int i = 0; i < numTrain; ++i) {
+    if (label_train_a_.cpu_data()[i] == label_train_b_.cpu_data()[i]) { // similar pairs
+      Dtype mdist= std::max(dist_sq_train_ab_.cpu_data()[i] - margin1, Dtype(0.0));
+      if (mdist == Dtype(0.0)) {
+        caffe_set(channels, Dtype(0.0), diff_train_ab_.mutable_cpu_data() + (i * channels));
+        caffe_set(channels, Dtype(0.0), feature_train_a_.mutable_cpu_data() + (i * channels));
+        caffe_set(channels, Dtype(0.0), feature_train_b_.mutable_cpu_data() + (i * channels));  
+      }
+      loss += mdist;
+    }
+    else {  // dissimilar pairs
+      Dtype cdist = std:: max(margin2 - dist_sq_train_ab_.cpu_data()[i], Dtype(0.0));
+      if (cdist == Dtype(0.0)) {
+        caffe_set(channels, Dtype(0.0), diff_train_ab_.mutable_cpu_data() + (i * channels));
+        caffe_set(channels, Dtype(0.0), feature_train_a_.mutable_cpu_data() + (i * channels));
+        caffe_set(channels, Dtype(0.0), feature_train_b_.mutable_cpu_data() + (i * channels));
+      }
+      loss += cdist;
+    }
+ }
+ loss = loss / static_cast<Dtype>(numTrain) / Dtype(2);
+ top[0]->mutable_cpu_data()[0] = loss;
+}
+
+template <typename Dtype>
+void SiameseContrastiveLossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
+
+  int numberp = this->layer_param_.siamese_contrastive_loss_param().numberp();
+  int hardp = this->layer_param_.siamese_contrastive_loss_param().hardp();
+  int hardn = this->layer_param_.siamese_contrastive_loss_param().hardn();
+  int num = bottom[0]->num();
+  int channels = bottom[0]->channels();
+  int numSort = num / (1 + numberp);
+  int numTrain = numSort * (hardp + hardn);
+
+  Dtype* bout = bottom[0] ->mutable_cpu_diff();
+  if (propagate_down[1]) {
+    LOG(FATAL) << this->type()
+               << " Layer cannot backpropagate to label inputs.";
+  }
+
+  if (propagate_down[0]) { 
+  const Dtype alpha = top[0]->cpu_diff()[0] / static_cast<Dtype>(numTrain);
+  for (int i = 0; i < numTrain; ++i) {
+      // back-propagation for a and b
+      int tempIndexAnchor = index_train_a_.cpu_data()[i];
+      int tempIndexCandidate = index_train_b_.cpu_data()[i];
+      if (label_train_a_.cpu_data()[i] == label_train_b_.cpu_data()[i]) { // similar pairs
+        caffe_cpu_axpby(channels,  // for a
+                        alpha * Dtype(1.0) / hardp, 
+                        diff_train_ab_.cpu_data() + (i * channels),
+                        Dtype(1.0),
+                        bout + (tempIndexAnchor * channels));
+
+        caffe_cpu_axpby(channels, // for b 
+                        alpha * Dtype(-1.0) / hardp, 
+                        diff_train_ab_.cpu_data() + (i * channels),
+                        Dtype(1.0),
+                        bout + (tempIndexCandidate * channels));
+      }
+      else { // dissimialr pairs
+        caffe_cpu_axpby(channels, // for a
+                        alpha * Dtype(-1.0) / hardn,
+                        diff_train_ab_.cpu_data() + (i * channels),
+                        Dtype(1.0),
+                        bout + (tempIndexAnchor * channels));
+        caffe_cpu_axpby(channels, // for b
+                        alpha * Dtype(1.0) / hardn,
+                        diff_train_ab_.cpu_data() + (i * channels),
+                        Dtype(1.0),
+                        bout + (tempIndexCandidate * channels));
+      }
+  }
+ }
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(SiameseContrastiveLossLayer);
+#endif
+
+INSTANTIATE_CLASS(SiameseContrastiveLossLayer);
+REGISTER_LAYER_CLASS(SiameseContrastiveLoss);
+
+}  // namespace caffe

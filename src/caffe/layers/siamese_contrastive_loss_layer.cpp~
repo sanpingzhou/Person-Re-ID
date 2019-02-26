@@ -1,0 +1,313 @@
+#include <algorithm>
+#include <vector>
+
+#include "caffe/layer.hpp"
+#include "caffe/loss_layers.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void SiameseContrastiveLossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  CHECK_EQ(bottom[0]->num(), bottom[1]->num());
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  CHECK_EQ(bottom[1]->channels(), 1);
+  CHECK_EQ(bottom[1]->height(), 1);
+  CHECK_EQ(bottom[1]->width(), 1);
+
+  int num = bottom[0]->num();
+  int channels = bottom[0]->channels();
+  int numnegative = this->layer_param_.siamese_contrastive_loss_param().numnegative();
+  feature_prob_.Reshape(num/2, channels, 1, 1);
+  label_prob_.Reshape(num/2, 1, 1, 1);
+  index_prob_.Reshape(num/2, 1, 1, 1);
+  feature_gallery_.Reshape(num/2, channels, 1, 1);
+  label_gallery_.Reshape(num/2, 1, 1, 1);
+  index_gallery_.Reshape(num/2, 1, 1, 1);
+  diff_ab_.Reshape(num/2, channels, 1, 1);
+  dist_ab_.Reshape(num/2, 1, 1, 1);
+
+
+  temp_feature_prob_.Reshape(num/(2 * (1 + numnegative)), channels, 1, 1);      // number of positive pairs
+  temp_feature_gallery_.Reshape(num/(2 * (1 + numnegative)), channels, 1, 1);
+  temp_sign_.Reshape(num/(2 * (1 + numnegative)), 1, 1, 1);
+  temp_dist_ab_.Reshape(num/(2 * (1 + numnegative)), 1, 1, 1);
+
+  feature_anchor_.Reshape(num/2, channels, 1, 1);
+  label_anchor_.Reshape(num/2, 1, 1, 1);
+  index_anchor_.Reshape(num/2, 1, 1, 1);
+  feature_positive_.Reshape(num/2, channels, 1, 1);
+  label_positive_.Reshape(num/2, 1, 1, 1);
+  index_positive_.Reshape(num/2, 1, 1, 1);
+  feature_negative_.Reshape(num/2, channels, 1, 1);
+  label_negative_.Reshape(num/2, 1, 1, 1);
+  index_negative_.Reshape(num/2, 1, 1, 1);
+
+  diff_anchor_positive_.Reshape(num/2, channels, 1, 1);
+  diff_anchor_negative_.Reshape(num/2, channels, 1, 1);
+  diff_positive_negative_.Reshape(num/2, channels, 1, 1);
+  dist_anchor_positive_.Reshape(num/2, 1, 1, 1);
+  dist_anchor_negative_.Reshape(num/2, 1, 1, 1);
+  dist_positive_negative_.Reshape(num/2, 1, 1, 1);
+}
+
+template <typename Dtype>
+void SiameseContrastiveLossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+ Dtype margin1 = this->layer_param_.siamese_contrastive_loss_param().margin1();
+ Dtype margin2 = this->layer_param_.siamese_contrastive_loss_param().margin2();
+ Dtype margin3 = this->layer_param_.siamese_contrastive_loss_param().margin3();
+ Dtype weight = this->layer_param_.siamese_contrastive_loss_param().weight();
+ int numpositive = this->layer_param_.siamese_contrastive_loss_param().numpositive();
+ int numnegative = this->layer_param_.siamese_contrastive_loss_param().numnegative();
+ int choosepositive = this->layer_param_.siamese_contrastive_loss_param().choosepositive();
+
+ int num = bottom[0]->num();
+ int channels = bottom[0]->channels();
+
+ // copy the feature representation and index to prob and gallery
+ int indexProb = 0;
+ int indexGallery = 0;
+ for (int i = 0; i < num; ++i) {
+    if (i % 2 == 0 ) {
+      caffe_copy(channels, bottom[0]->cpu_data() + (i * channels),
+                 feature_prob_.mutable_cpu_data() + (indexProb * channels));
+      label_prob_.mutable_cpu_data()[indexProb] = bottom[1]->cpu_data()[i];
+      index_prob_.mutable_cpu_data()[indexProb] = i;
+      ++indexProb;
+    } 
+    else {
+      caffe_copy(channels, bottom[0]->cpu_data() + (i * channels),
+                 feature_gallery_.mutable_cpu_data() + (indexGallery * channels));
+      label_gallery_.mutable_cpu_data()[indexGallery] = bottom[1]->cpu_data()[i];
+      index_gallery_.mutable_cpu_data()[indexGallery] = i;
+      ++indexGallery;
+    }    
+ }
+ 
+ // siamese part 
+ // computting the distace between prob and gallery
+ caffe_sub(
+      	num/2 * channels,
+      	feature_prob_.cpu_data(),            // input prob features
+      	feature_gallery_.cpu_data(),         // input gallery featurs
+      	diff_ab_.mutable_cpu_data());
+
+ Dtype loss1(0.0);
+ for (int i = 0; i < num/2; ++i) {
+   dist_ab_.mutable_cpu_data()[i] = caffe_cpu_dot (channels,
+      diff_ab_.cpu_data() + (i * channels), diff_ab_.cpu_data() + (i * channels));
+   if (static_cast<int>(label_prob_.cpu_data()[i] == label_gallery_.cpu_data()[i])) {  // similar pairs
+      Dtype cdist = std::max(dist_ab_.cpu_data()[i] - margin1, Dtype(0.0));
+      if (cdist == Dtype(0.0)) {
+         caffe_set(channels, Dtype(0.0), diff_ab_.mutable_cpu_data() + (i * channels));
+      }
+      loss1 += cdist;
+    }
+   else {  // dissimilar pairs
+     Dtype mdist = std::max(margin2 - dist_ab_.cpu_data()[i], Dtype(0.0));
+     if (mdist == Dtype(0.0)) {
+        caffe_set(channels, Dtype(0.0), diff_ab_.mutable_cpu_data() + (i * channels));
+     }
+     loss1 += mdist;
+   } 
+ }
+
+// triplet part
+ Dtype loss2(0.0);
+ caffe_set(channels * (num/2), Dtype(0.0), feature_anchor_.mutable_cpu_data());
+ caffe_set(channels * (num/2), Dtype(0.0), feature_positive_.mutable_cpu_data());
+ caffe_set(channels * (num/2), Dtype(0.0), feature_negative_.mutable_cpu_data());
+
+ // create set according to positive
+ int countPositive = 0;
+ for (int i = 0; i < num/2; i = i + (1 + numnegative)) { // similar pairs
+    if (label_prob_.cpu_data()[i] == label_gallery_.cpu_data()[i]) {
+       caffe_copy(channels, feature_prob_.cpu_data() + (i * channels),
+                  temp_feature_prob_.mutable_cpu_data() + (countPositive * channels));
+       caffe_copy(channels, feature_gallery_.cpu_data() + (i * channels),
+                  temp_feature_gallery_.mutable_cpu_data() + (countPositive * channels));
+       temp_dist_ab_.mutable_cpu_data()[countPositive] = dist_ab_.cpu_data()[i];
+       temp_sign_.mutable_cpu_data()[countPositive] = i;
+       ++ countPositive;
+    }
+ }
+ 
+ for (int i = 0; i < num/(2 * (1 + numnegative)); i = i + numpositive) {  // rank positive in local (large to small)
+    for (int j = i; j < numpositive; ++j) {
+       if (temp_dist_ab_.cpu_data()[i] < temp_dist_ab_.cpu_data()[j]) {
+          Dtype tempDist = temp_dist_ab_.cpu_data()[i];
+          temp_dist_ab_.mutable_cpu_data()[i] = temp_dist_ab_.cpu_data()[j];
+          temp_dist_ab_.mutable_cpu_data()[j] = tempDist;
+
+          int tempSign = temp_sign_.cpu_data()[i];
+          temp_sign_.mutable_cpu_data()[i] = temp_sign_.cpu_data()[j];
+          temp_sign_.mutable_cpu_data()[j] = tempSign;
+       }      
+    }
+ }
+
+ for (int i = choosepositive; i < num/(2 * (1 + numnegative)); i = i + numpositive) {
+    if (numpositive > choosepositive) {
+      int tempIndex = temp_sign_.cpu_data()[i];
+      caffe_set(channels, Dtype(0.0), feature_prob_.mutable_cpu_data() + (tempIndex * channels));
+      caffe_set(channels, Dtype(0.0), feature_gallery_.mutable_cpu_data() + (tempIndex * channels));
+      label_prob_.mutable_cpu_data()[tempIndex] = -1;
+      label_gallery_.mutable_cpu_data()[tempIndex] = -1;
+    } else {
+       break;
+    }
+
+ }
+
+ /*for (int i = 0; i < num/(2 * (1 + numnegative)); i = i + numpositive) {
+    for (int j = i + choosepositive - 1; j < numpositive; ++j) {
+      int tempIndex = temp_sign_.cpu_data()[i + j]);
+      caffe_set(channels, Dtype(0.0), feature_prob_.mutable_cpu_data() + (tempIndex * channels));
+      caffe_set(channels, Dtype(0.0), feature_gallery_.mutable_cpu_data() + (tempIndex * channels));
+      label_prob_.mutable_cpu_data()[tempIndex] = -1;
+      label_gallery_.mutable_cpu_data()[tempIndex] = -1;   
+    }   
+ }*/
+ 
+ // generate triplets
+ for (int i = 0; i < num/2; ++i) { 
+    if (label_prob_.cpu_data()[i] == label_gallery_.cpu_data()[i] && label_prob_.cpu_data()[i] != -1 && label_gallery_.cpu_data()[i] != -1 ) {  // similar pairs
+       int indexSemiHardNegative;
+       int countSemiHardNegative = 0;
+       while (1) {
+	 indexSemiHardNegative = rand() % (num/2);
+         if (label_prob_.cpu_data()[i] != label_gallery_.cpu_data()[indexSemiHardNegative]) {
+             Dtype relativeDistance = std::max(dist_ab_.cpu_data()[indexSemiHardNegative] - dist_ab_.cpu_data()[i], Dtype(0.0));
+             ++countSemiHardNegative;
+             if (relativeDistance == Dtype(0.0) || label_gallery_.cpu_data()[indexSemiHardNegative] == -1 || countSemiHardNegative == 10000) {
+             	break;
+             }
+         }
+       }
+       caffe_copy(channels, feature_prob_.cpu_data() + (i * channels),
+                  feature_anchor_.mutable_cpu_data() + (i * channels));
+       caffe_copy(channels, feature_gallery_.cpu_data() + (i * channels),
+                  feature_positive_.mutable_cpu_data() + (i * channels));
+       caffe_copy(channels, feature_gallery_.cpu_data() + (indexSemiHardNegative * channels),
+                  feature_negative_.mutable_cpu_data() + (i * channels));
+       label_anchor_.mutable_cpu_data()[i] = label_prob_.cpu_data()[i];
+       label_positive_.mutable_cpu_data()[i] = label_gallery_.cpu_data()[i];
+       label_negative_.mutable_cpu_data()[i] = label_gallery_.cpu_data()[indexSemiHardNegative];
+       index_anchor_.mutable_cpu_data()[i] = index_prob_.cpu_data()[i];
+       index_positive_.mutable_cpu_data()[i] = index_gallery_.cpu_data()[i];
+       index_negative_.mutable_cpu_data()[i] = index_gallery_.cpu_data()[indexSemiHardNegative];
+   
+    } 
+ }
+ caffe_sub(num/2 * channels, 
+           feature_anchor_.cpu_data(),                // anchor
+	   feature_positive_.cpu_data(),              // positive
+           diff_anchor_positive_.mutable_cpu_data()); // anchor - positive
+ caffe_sub(num/2 * channels, 
+           feature_anchor_.cpu_data(),                // anchor
+	   feature_negative_.cpu_data(),              // negative
+           diff_anchor_negative_.mutable_cpu_data()); // anchor - negative
+ caffe_sub(num/2 * channels, 
+           feature_positive_.cpu_data(),                // positive
+	   feature_negative_.cpu_data(),                // negative
+           diff_positive_negative_.mutable_cpu_data()); // positive - negative
+
+ for (int i = 0; i < num/2; ++i) {
+    dist_anchor_positive_.mutable_cpu_data()[i] = caffe_cpu_dot(
+				channels, diff_anchor_positive_.cpu_data() + (i * channels), diff_anchor_positive_.cpu_data() + (i * channels));
+    dist_anchor_negative_.mutable_cpu_data()[i] = caffe_cpu_dot(
+				channels, diff_anchor_negative_.cpu_data() + (i * channels), diff_anchor_negative_.cpu_data() + (i * channels));
+    dist_positive_negative_.mutable_cpu_data()[i] = caffe_cpu_dot(
+				channels, diff_positive_negative_.cpu_data() + (i * channels), diff_positive_negative_.cpu_data() + (i * channels));
+    Dtype sdist =  std::max(margin3 + dist_anchor_positive_.cpu_data()[i] - dist_anchor_negative_.cpu_data()[i], Dtype(0.0));
+    if (sdist == Dtype(0.0)) {
+      caffe_set(channels, Dtype(0.0), diff_anchor_positive_.mutable_cpu_data() + (i * channels));
+      caffe_set(channels, Dtype(0.0), diff_anchor_negative_.mutable_cpu_data() + (i * channels));
+      caffe_set(channels, Dtype(0.0), diff_positive_negative_.mutable_cpu_data() + (i * channels));
+    }
+    loss2 += sdist;
+ }
+
+ Dtype loss = loss1 + weight * loss2;
+ loss = loss / static_cast<Dtype>(bottom[0]->num());
+ top[0]->mutable_cpu_data()[0] = loss;
+}
+
+template <typename Dtype>
+void SiameseContrastiveLossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
+  Dtype weight = this->layer_param_.siamese_contrastive_loss_param().weight();
+  int num = bottom[0]->num();
+  int channels = bottom[0]->channels();
+  Dtype* bout = bottom[0] ->mutable_cpu_diff();
+  if (propagate_down[1]) {
+    LOG(FATAL) << this->type()
+               << " Layer cannot backpropagate to label inputs.";
+  }
+  if (propagate_down[0]) { 
+  const Dtype alpha = 2 * top[0]->cpu_diff()[0] / static_cast<Dtype>(num);
+  for (int i = 0; i < num/2; ++i) {
+      // back-propagation for prob and gallery 
+      int tempindex_prob = index_prob_.cpu_data()[i];
+      int tempindex_gallery = index_gallery_.cpu_data()[i];
+      int tempindex_anchor = index_anchor_.cpu_data()[i];
+      int tempindex_positive = index_positive_.cpu_data()[i];
+      int tempindex_negative = index_negative_.cpu_data()[i];
+      if (label_prob_.cpu_data()[i] == label_gallery_.cpu_data()[i]) { // similar pairs
+        caffe_cpu_axpby(channels,  // for prob
+                        alpha * Dtype(1.0), 
+                        diff_ab_.cpu_data() + (i * channels),
+                        Dtype(0.0),
+                        bout + (tempindex_prob * channels));
+
+        caffe_cpu_axpby(channels, // for gallery 
+                        alpha * Dtype(-1.0), 
+                        diff_ab_.cpu_data() + (i * channels),
+                        Dtype(0.0),
+                        bout + (tempindex_gallery * channels));
+      }
+      else { // dissimialr pairs
+        caffe_cpu_axpby(channels, // for prob
+                        alpha * Dtype(-1.0),
+                        diff_ab_.cpu_data() + (i * channels),
+                        Dtype(0.0),
+                        bout + (tempindex_prob * channels));
+        caffe_cpu_axpby(channels, // for gallery
+                        alpha * Dtype(1.0),
+                        diff_ab_.cpu_data() + (i * channels),
+                        Dtype(0.0),
+                        bout + (tempindex_gallery * channels));
+      }
+      caffe_cpu_axpby(channels,  // anchor
+		      alpha * weight * Dtype(-1.0),
+		      diff_positive_negative_.cpu_data() + (i * channels),
+		      Dtype(1.0),
+		      bout + (tempindex_anchor * channels));
+      caffe_cpu_axpby(channels, // positive
+		      alpha * weight * Dtype(-1.0),
+		      diff_anchor_positive_.cpu_data() + (i * channels),
+		      Dtype(1.0),
+		      bout + (tempindex_positive * channels));
+      caffe_cpu_axpby(channels, // negative
+		      alpha * weight * Dtype(1.0),
+		      diff_anchor_negative_.cpu_data() + (i * channels),
+		      Dtype(1.0),
+		      bout + (tempindex_negative * channels));
+  }
+ }
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(SiameseContrastiveLossLayer);
+#endif
+
+INSTANTIATE_CLASS(SiameseContrastiveLossLayer);
+REGISTER_LAYER_CLASS(SiameseContrastiveLoss);
+
+}  // namespace caffe
